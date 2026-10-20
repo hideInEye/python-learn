@@ -1,0 +1,5 @@
+langchain-deepseek
+python-dotenv
+socksio
+pytest
+ruff
