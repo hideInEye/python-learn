@@ -3,3 +3,4 @@ python-dotenv
 socksio
 pytest
 ruff
+pydantic>=2,<3
