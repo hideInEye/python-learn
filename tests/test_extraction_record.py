@@ -19,6 +19,7 @@ from extraction_record import (
     collect_extraction_metadata,
     new_extraction_record,
 )
+from extraction_rules import review_extraction
 
 
 # 写入两条中文多行内容，确认 JSONL 逐行追加、编号不同，且 V01 文件完全不变。
@@ -86,7 +87,8 @@ def test_redaction_of_allowed_nested_fields_does_not_mutate_original() -> None:
 
 # 在不同层级夹带请求头、对象或错误类型，确认白名单在落盘之前拒绝它们。
 @pytest.mark.parametrize(
-    "location", ["top", "parameters", "usage", "extraction", "checks", "input", "error"]
+    "location",
+    ["top", "parameters", "usage", "extraction", "checks", "review", "input", "error"],
 )
 def test_whitelist_rejects_extra_fields_and_nested_objects_before_writing(
     location: str,
@@ -107,6 +109,8 @@ def test_whitelist_rejects_extra_fields_and_nested_objects_before_writing(
         record["extraction"] = secret_object
     elif location == "checks":
         record["checks"] = secret_object
+    elif location == "review":
+        record["review"] = secret_object
     elif location == "input":
         record["input_text"] = secret_object
     else:
@@ -123,6 +127,53 @@ def test_nan_is_rejected_before_creating_file() -> None:
     record = new_extraction_record(max_tokens=1024)
     # float("nan") 构造非数值标记；Python 能表示它，但严格 JSON 不允许。
     record["latency_ms"] = float("nan")
+    with pytest.raises(ValueError):
+        append_extraction_record(record)
+    assert not extraction_record.EXTRACTION_RUNS_PATH.exists()
+
+
+# 从合法的“请求完成但需要追问”记录出发，逐项破坏新增字段，验证保存层会拒绝。
+@pytest.mark.parametrize(
+    "case", ["extra", "nested-object", "request-status", "processing-status", "checks"]
+)
+def test_review_whitelist_and_status_consistency_before_writing(case: str) -> None:
+    extraction = AfterSalesExtraction(
+        order_id=None,
+        product_name=None,
+        issue_description=None,
+        requested_action=None,
+        received_time_text=None,
+        ambiguities=[],
+        evidence=[],
+    )
+    review = review_extraction("请帮忙处理售后。", extraction)
+    record = new_extraction_record(max_tokens=1024)
+    # update 同时赋值多个字典键；这些值只来自本地固定测试数据。
+    record.update(
+        extraction=extraction.model_dump(mode="json"),
+        review=review.model_dump(mode="json"),
+        request_status="completed",
+        processing_status="needs_clarification",
+        status="needs_clarification",
+        checks={
+            "status": review.status,
+            "evidence_errors": review.evidence_errors,
+            "missing_fields": review.missing_fields,
+            "clarification_questions": review.questions,
+        },
+    )
+    if case == "extra":
+        record["review"]["headers"] = {"Authorization": "test-only-secret"}
+    elif case == "nested-object":
+        record["review"]["questions"] = [{"headers": "not-for-log"}]
+    elif case == "request-status":
+        record["request_status"] = "error"
+    elif case == "processing-status":
+        record["processing_status"] = "draft_ready"
+    else:
+        record["checks"]["clarification_questions"] = []
+
+    # 异常必须发生在创建文件前，不能留下含非法字段或矛盾状态的一行日志。
     with pytest.raises(ValueError):
         append_extraction_record(record)
     assert not extraction_record.EXTRACTION_RUNS_PATH.exists()

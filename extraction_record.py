@@ -6,7 +6,7 @@ from typing import Literal, TypedDict, get_args  # 类型描述，以及读取 L
 from langchain_core.messages import AIMessage
 
 from extraction_models import SCHEMA_VERSION, AfterSalesExtraction
-from extraction_rules import CheckResult
+from extraction_rules import RULES_VERSION, CheckResult, ReviewResult
 from extractor import OUTPUT_METHODS
 from record_store import append_jsonl, new_record
 
@@ -25,6 +25,9 @@ ExtractionStatus = Literal[
     "draft_ready",
     "cancelled",
 ]
+# not_started 表示输入/配置阶段就终止，尚未进入模型请求阶段。
+# completed 只说明请求返回，不代表 Schema 或业务规则通过。
+RequestStatus = Literal["not_started", "completed", "error", "cancelled"]
 
 
 class ExtractionRecord(TypedDict):
@@ -32,6 +35,7 @@ class ExtractionRecord(TypedDict):
     run_id: str  # 每次运行的唯一编号，连接控制台输出与日志。
     created_at: str  # 带时区的 ISO 时间字符串。
     schema_version: str  # 本次字段规则的版本。
+    rules_version: str  # Python 业务检查规则版本，与模型 Schema 分开记录。
     prompt_sha256: str | None  # 完整系统提示词的哈希；未构建成功则为空。
     requested_model: str | None  # 配置指定的模型名称。
     returned_model: str | None  # 能确认来自响应的实际标识，未知时不补请求值。
@@ -40,8 +44,11 @@ class ExtractionRecord(TypedDict):
     output_mode: str  # 实际方式：invoke、json_mode 或 function_calling。
     parameters: dict[str, object]  # 只保存温度、Token 上限等允许的参数。
     extraction: dict[str, object] | None  # Schema 通过后的抽取结果。
+    review: dict[str, object] | None  # ReviewResult.model_dump(mode="json") 的结果。
+    request_status: RequestStatus  # 请求是否返回/出错，与业务状态独立。
+    processing_status: ExtractionStatus  # 本次处理的最终状态。
     checks: CheckResult | None  # 业务检查结果；未执行时为空。
-    status: ExtractionStatus  # 本次处理的最终状态。
+    status: ExtractionStatus  # 保留旧字段，值始终与 processing_status 一致。
     latency_ms: float | None  # 毫秒耗时，float 表示可带小数。
     usage: dict[str, int | None] | None  # 实际 Token 计数，未知项保留 None。
     finish_reason: str | None  # 供应商返回的结束原因，例如 length。
@@ -62,6 +69,7 @@ def new_extraction_record(
         "run_id": base["run_id"],
         "created_at": base["created_at"],
         "schema_version": SCHEMA_VERSION,
+        "rules_version": RULES_VERSION,
         "prompt_sha256": None,
         "requested_model": None,
         "returned_model": None,
@@ -71,6 +79,9 @@ def new_extraction_record(
         # ** 在字典中展开已有键值对，类似 JS 的 {...object, timeout: 30}。
         "parameters": {**base["parameters"], "timeout": 30, "max_retries": 0},
         "extraction": None,
+        "review": None,
+        "request_status": "not_started",
+        "processing_status": "input_error",
         "checks": None,
         "status": "input_error",  # 初始值；后续完成请求和检查时再更新。
         "latency_ms": None,
@@ -141,6 +152,9 @@ def append_extraction_record(record: ExtractionRecord, *, api_key: str = "") -> 
         or record["mode"] not in OUTPUT_METHODS
         or record["output_mode"] != OUTPUT_METHODS[record["mode"]]
         or record["status"] not in get_args(ExtractionStatus)
+        or record["processing_status"] != record["status"]
+        or record["request_status"] not in get_args(RequestStatus)
+        or record["rules_version"] != RULES_VERSION
     ):
         raise ValueError("抽取任务类型、输出模式或状态无效。")
     # 文本字段可以未知，但不能偷偷放入客户端对象、请求头字典等其他类型。
@@ -148,6 +162,7 @@ def append_extraction_record(record: ExtractionRecord, *, api_key: str = "") -> 
         "run_id",
         "created_at",
         "schema_version",
+        "rules_version",
         "prompt_sha256",
         "requested_model",
         "returned_model",
@@ -199,6 +214,21 @@ def append_extraction_record(record: ExtractionRecord, *, api_key: str = "") -> 
     if record["extraction"] is not None:
         # 再检查嵌套字段，禁止在合法字段中夹带请求头或任意对象。
         AfterSalesExtraction.model_validate(record["extraction"])
+    review = record["review"]
+    if review is not None:
+        # 精确白名单拒绝任意附加字段；Pydantic 再检查每个字段的实际类型。
+        if not isinstance(review, dict) or set(review) != set(
+            ReviewResult.model_fields
+        ):
+            raise ValueError("程序检查结果字段不符合白名单。")
+        ReviewResult.model_validate(review)
+        if (
+            review["status"] != record["processing_status"]
+            or record["request_status"] != "completed"
+            or record["extraction"] is None
+            or record["checks"] is None
+        ):
+            raise ValueError("程序检查结果与请求状态或抽取结果不一致。")
     checks = record["checks"]  # None 表示流程尚未到业务检查阶段。
     if checks is not None:
         if set(checks) != set(CheckResult.__annotations__) or checks["status"] not in {
@@ -218,6 +248,16 @@ def append_extraction_record(record: ExtractionRecord, *, api_key: str = "") -> 
                 raise ValueError("检查结果必须为文本列表。")
         if checks["status"] != record["status"]:  # 避免日志同时给出矛盾的结论。
             raise ValueError("检查结果与最终状态不一致。")
+        # checks 是旧字段的兼容展示，不再执行第二次业务检查。
+        if review is not None and checks != {
+            "status": review["status"],
+            "evidence_errors": review["evidence_errors"],
+            "missing_fields": None
+            if review["status"] == "evidence_error"
+            else review["missing_fields"],
+            "clarification_questions": review["questions"],
+        }:
+            raise ValueError("新旧检查结果字段不一致。")
 
     payload = redact_values(record, api_key)  # 校验后复制并脱敏，不修改原记录。
     return append_jsonl(payload, EXTRACTION_RUNS_PATH)  # 真正追加文件，并返回保存路径。

@@ -124,6 +124,13 @@ def parse_extraction_result(
     # and 要求两边条件都成立；prompt 的普通响应没有框架解析状态。
     if mode != "prompt" and "parsing_error" not in result:
         raise ExtractionParseError("结构化响应缺少解析状态。")
+    if mode != "prompt":
+        # 先检查框架解析错误，再检查对象类型；没有错误不等于一定有结果。
+        # 只输出本地固定说明，不把 parsing_error 的异常全文带到控制台或日志。
+        if result["parsing_error"] is not None:
+            raise ExtractionParseError("输出无法解析或未通过 Schema 校验。")
+        if not isinstance(result.get("parsed"), AfterSalesExtraction):
+            raise ExtractionParseError("未得到有效的 AfterSalesExtraction 结果。")
 
     # dict.get() 在键缺失时返回 None；result["raw"] 则会直接抛 KeyError。
     raw = result.get("raw")
@@ -138,13 +145,6 @@ def parse_extraction_result(
             or raw.additional_kwargs.get("tool_calls")
         ):
             raise ExtractionParseError("文本输出模式不应返回工具调用。")
-        if mode == "json":
-            # is not None 检查是否真的有错误对象，不能靠对象的真假值替代。
-            if result["parsing_error"] is not None:
-                raise ExtractionParseError("JSON 响应无法解析或未通过 Schema 校验。")
-            # 没有异常并不保证有结果；None 和普通字典都不算有效 Schema 对象。
-            if not isinstance(result.get("parsed"), AfterSalesExtraction):
-                raise ExtractionParseError("未得到有效的 AfterSalesExtraction 结果。")
         try:
             # .text 只取可见文本，不包含额外推理。直接校验全文，不截取或去围栏。
             # json_mode 的框架解析器可能容忍 Markdown / 截断 JSON；
@@ -167,8 +167,6 @@ def parse_extraction_result(
     # len() 计算数量；有效和无效的工具调用合计必须恰好一个。
     if len(raw.tool_calls) + len(raw.invalid_tool_calls) != 1:
         raise ExtractionParseError("响应必须恰好包含一个工具调用。")
-    if result["parsing_error"] is not None:
-        raise ExtractionParseError("工具调用参数无法解析或未通过 Schema 校验。")
     # or 会短路：存在 invalid_tool_calls 时，不再访问可能为空的 tool_calls[0]。
     # [0] 取第一个元素；__name__ 读取 Schema 类名，避免另写一份工具名。
     if (

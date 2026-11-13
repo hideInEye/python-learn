@@ -12,7 +12,9 @@ from extraction_rules import (
     BUSINESS_FIELDS,
     MISSING_QUESTIONS,
     OTHER_QUESTION,
+    REQUIRED_QUESTIONS,
     check_extraction,
+    review_extraction,
 )
 
 TEXT = "订单 A10086 的耳机左边没声音，昨天收到，我想换货。"
@@ -210,3 +212,140 @@ def test_present_quote_is_not_a_proof_of_semantic_correctness(
     complete.product_name = "机械检查无法判断这个商品名是否正确"
     # 引用本身真实存在，却没有证明 product_name 的语义正确。
     assert check_extraction(complete, TEXT)["status"] == "draft_ready"
+
+
+# 保留原有三个验收样本：正常、缺订单号、虚构订单号；仅补注释与类型提示。
+@pytest.mark.parametrize(
+    "order_id,source,expected_status",
+    [
+        (
+            "A10086",
+            "订单 A10086 的耳机左边没声音，我想换货。",
+            "draft_ready",
+        ),
+        (
+            None,
+            "耳机左边没声音，我想换货。",
+            "needs_clarification",
+        ),
+        (
+            "A99999",
+            "耳机左边没声音，我想换货。",
+            "evidence_error",
+        ),
+    ],
+)
+def test_review(order_id: str | None, source: str, expected_status: str) -> None:
+    # 固定测试数据只在本地构造，不调用模型；不缺失的字段都附上原文证据。
+    evidence = [
+        Evidence(field="product_name", quote="耳机"),
+        Evidence(field="issue_description", quote="左边没声音"),
+        Evidence(field="requested_action", quote="我想换货"),
+    ]
+
+    if order_id is not None:
+        evidence.append(Evidence(field="order_id", quote=order_id))
+
+    extracted = AfterSalesExtraction(
+        order_id=order_id,
+        product_name="耳机",
+        issue_description="左边没声音",
+        requested_action="exchange",
+        received_time_text=None,
+        ambiguities=[],
+        evidence=evidence,
+    )
+
+    result = review_extraction(source, extracted)
+
+    # 不只比较状态，还验证缺项、证据问题和追问，防止状态正确但内容错误。
+    assert result.status == expected_status
+
+    if expected_status == "needs_clarification":
+        assert result.missing_fields == ["order_id"]
+        assert result.questions == ["请提供订单号。"]
+
+    elif expected_status == "evidence_error":
+        assert result.evidence_errors
+        assert result.questions == []
+
+    else:
+        assert result.missing_fields == []
+        assert result.evidence_errors == []
+        assert result.questions == []
+
+
+# 空白仍是 Schema 允许的字符串，但业务上等同缺失；不能顺手修改原值。
+@pytest.mark.parametrize("field", ["order_id", "issue_description"])
+@pytest.mark.parametrize("value", [None, "", " \t\n"])
+def test_review_missing_required_fields_use_fixed_questions(
+    field: str, value: str | None, complete: AfterSalesExtraction
+) -> None:
+    setattr(complete, field, value)
+    complete.evidence = [item for item in complete.evidence if item.field != field]
+    before = complete.model_dump(mode="json")
+
+    result = review_extraction(TEXT, complete)
+
+    assert result.status == "needs_clarification"
+    assert result.missing_fields == [field]
+    assert result.questions == [REQUIRED_QUESTIONS[field]]
+    assert result.evidence_errors == []
+    assert complete.model_dump(mode="json") == before
+
+
+# 每次构造一种证据错误；已有三个样本未覆盖的“订单号与其引用不匹配”也要拒绝。
+@pytest.mark.parametrize(
+    "case",
+    ["missing", "blank", "absent", "order-mismatch", "null-with-evidence"],
+)
+def test_review_rejects_bad_evidence_without_changing_input(
+    case: str, complete: AfterSalesExtraction
+) -> None:
+    if case == "missing":
+        complete.evidence = complete.evidence[1:]
+    elif case == "blank":
+        complete.evidence[0].quote = " \t"
+    elif case == "absent":
+        complete.evidence[0].quote = "不存在于原文"
+    elif case == "order-mismatch":
+        # 订单号和引用分别都在原文中，但这条引用不能证明该订单号。
+        complete.evidence[0].quote = "耳机"
+    else:
+        complete.order_id = None
+    before = complete.model_dump(mode="json")
+
+    result = review_extraction(TEXT, complete)
+
+    assert result.status == "evidence_error"
+    assert result.evidence_errors
+    assert result.questions == []  # 结果错误不能伪装成用户信息不足。
+    if case == "order-mismatch":
+        assert "order_id 与引用的证据不对应。" in result.evidence_errors
+    assert complete.model_dump(mode="json") == before
+
+
+# 歧义和 other 分别测试；追问来自固定模板，并保留原始歧义而不选择答案。
+@pytest.mark.parametrize("case", ["ambiguity", "blank-ambiguity", "other"])
+def test_review_clarifies_ambiguity_or_other_with_fixed_templates(
+    case: str, complete: AfterSalesExtraction
+) -> None:
+    if case == "other":
+        complete.requested_action = "other"
+        expected = "请说明具体希望如何处理，我们再确认后续流程。"
+    elif case == "ambiguity":
+        complete.ambiguities = ["换货还是维修？"]
+        expected = "请澄清：换货还是维修？"
+    else:
+        complete.ambiguities = [" \t"]
+        expected = "请补充说明存在歧义的信息。"
+    before = complete.model_dump(mode="json")
+
+    result = review_extraction(TEXT, complete)
+
+    assert result.status == "needs_clarification"
+    assert result.missing_fields == []
+    assert result.evidence_errors == []
+    assert result.questions == [expected]
+    assert result.ambiguities == complete.ambiguities
+    assert complete.model_dump(mode="json") == before

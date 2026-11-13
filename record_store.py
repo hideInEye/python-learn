@@ -119,6 +119,7 @@ def append_record(record: RunRecord, *, api_key: str = "") -> Path:
 
 def append_jsonl(payload: dict[str, object], path: Path) -> Path:
     """共享追加写入机制；调用方须先完成字段白名单校验和脱敏。"""
+    # 本练习只支持单进程串行写入；没有文件锁，不保证多进程/多线程并发安全。
     # 不使用 default=str，不序列化客户端或任意对象。转义后的换行仍在同一行内。
     # ensure_ascii=False 保留中文；allow_nan=False 拒绝 JSON 不支持的 NaN/Infinity。
     # separators 去掉无用空格；回答里的换行被转义，不会变成多条日志。

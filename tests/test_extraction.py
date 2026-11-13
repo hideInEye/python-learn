@@ -23,6 +23,7 @@ import extract
 import extraction_record
 import llm_client
 from extraction_models import AfterSalesExtraction
+from extraction_rules import review_extraction
 from extractor import (
     ExtractionParseError,
     build_extraction_prompt,
@@ -150,7 +151,15 @@ def test_cli_success_preserves_input_and_existing_model_settings(
     captured = capsys.readouterr()
     assert json.loads(captured.out) == {
         "status": "draft_ready",
+        "processing_status": "draft_ready",
         "extraction": extraction.model_dump(),
+        "review": {
+            "status": "draft_ready",
+            "missing_fields": [],
+            "evidence_errors": [],
+            "ambiguities": [],
+            "questions": [],
+        },
         "checks": {
             "status": "draft_ready",
             "evidence_errors": [],
@@ -165,6 +174,9 @@ def test_cli_success_preserves_input_and_existing_model_settings(
     assert saved["input_text"] == text
     assert saved["status"] == "draft_ready"
     assert captured.err == (
+        "抽取结果：extraction；程序检查结果：review。\n"
+        "当前检查通过，仅供人工复核，不表示退款批准。\n"
+        "最终处理状态: draft_ready\n"
         f"run_id: {saved['run_id']}\n"
         f"记录已保存: {extraction_record.EXTRACTION_RUNS_PATH}\n"
     )
@@ -343,6 +355,7 @@ def test_request_error_is_distinct_and_never_retried(
 )
 def test_invalid_structured_results_fail_without_json_or_retry(
     case: str,
+    monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
     mock_model: tuple[Mock, Mock],
     extraction: AfterSalesExtraction,
@@ -376,6 +389,9 @@ def test_invalid_structured_results_fail_without_json_or_retry(
         # 原始列表含未标准化为 tool_calls / invalid_tool_calls 的异常条目。
         result["raw"] = raw_message([valid_call, {"type": "unexpected"}])
     invoke.return_value = result
+    # 多工具、缺少结果等旧守卫仍必须先于新接入的规则函数。
+    reviewer = Mock(side_effect=AssertionError("无效结构不能进入规则"))
+    monkeypatch.setattr(extract, "review_extraction", reviewer)
 
     assert extract.main(["--text", TEXT]) == 3
 
@@ -383,6 +399,7 @@ def test_invalid_structured_results_fail_without_json_or_retry(
         AfterSalesExtraction, method="function_calling", include_raw=True
     )
     invoke.assert_called_once()
+    reviewer.assert_not_called()
     captured = capsys.readouterr()
     assert captured.out == ""
     assert "解析校验错误" in captured.err
@@ -524,7 +541,13 @@ def test_business_status_and_log_after_exactly_one_call(
     model.with_structured_output.return_value.invoke.assert_called_once()
     model.with_structured_output.assert_called_once()
     record = saved_record()
-    output = json.loads(capsys.readouterr().out)
+    captured = capsys.readouterr()
+    output = json.loads(captured.out)
+    # 业务追问或证据错误不等于请求失败；这两个维度必须分别记录。
+    assert record["request_status"] == "completed"
+    assert record["processing_status"] == output["processing_status"] == expected_status
+    assert record["review"] == output["review"]
+    assert record["rules_version"] == "v1"
     assert record["status"] == output["status"] == expected_status
     assert record["checks"] == output["checks"]
     assert record["extraction"] == output["extraction"] == extraction.model_dump()
@@ -533,10 +556,16 @@ def test_business_status_and_log_after_exactly_one_call(
         assert record["checks"]["clarification_questions"]
         assert record["error_type"] is None
         assert record["error_message"] is None
+        assert "固定追问：" in captured.err
+        for question in record["review"]["questions"]:
+            assert f"- {question}" in captured.err
     else:
         assert record["checks"]["missing_fields"] is None
         assert record["checks"]["clarification_questions"] == []
         assert record["error_type"] == "EvidenceCheckError"
+        assert "抽取结果存在证据问题" in captured.err
+        assert "固定追问：" not in captured.err
+        assert record["review"]["questions"] == []
 
 
 # 用可控时钟和模拟元数据验证耗时、哈希、实际用量及脱敏，不使用真实 sleep。
@@ -576,6 +605,8 @@ def test_actual_metadata_versions_parameters_and_controlled_total_latency(
     record = saved_record()
     assert record["task_type"] == "after_sales_extraction"
     assert record["schema_version"] == "after-sales-v1"
+    assert record["rules_version"] == "v1"
+    assert record["request_status"] == "completed"
     assert (
         record["prompt_sha256"]
         == hashlib.sha256(
@@ -653,6 +684,11 @@ def test_request_failure_and_cancel_save_safe_records(
     invoke.assert_called_once()
     record = saved_record()
     assert record["status"] == status
+    assert record["processing_status"] == status
+    assert record["request_status"] == (
+        "cancelled" if status == "cancelled" else "error"
+    )
+    assert record["review"] is None
     assert record["error_type"] == type(failure).__name__
     assert record["error_message"]
     assert record["extraction"] is None
@@ -665,21 +701,39 @@ def test_request_failure_and_cancel_save_safe_records(
     assert "other-credential" not in captured.err + json.dumps(record)
 
 
-# 让 parsed 为空，再把业务检查器设成一调用就失败的 Mock，验证流程顺序。
+# 模拟不同技术错误；规则 Mock 从未被调用，证明失败不会进入业务检查。
+@pytest.mark.parametrize("case", ["parsed-none", "parsing-error", "request-error"])
 def test_schema_failure_does_not_reach_business_checks(
+    case: str,
     monkeypatch: pytest.MonkeyPatch,
     mock_model: tuple[Mock, Mock],
 ) -> None:
     response = mock_model[0].with_structured_output.return_value.invoke.return_value
-    response["parsed"] = None
+    if case == "parsed-none":
+        response["parsed"] = None
+    elif case == "parsing-error":
+        response["parsing_error"] = ValueError("测试解析失败")
+    else:
+        mock_model[
+            0
+        ].with_structured_output.return_value.invoke.side_effect = RuntimeError(
+            "测试请求失败"
+        )
     # 如果错误地进入业务检查，这个 Mock 会抛 AssertionError 让测试失败。
     checker = Mock(side_effect=AssertionError("Schema 未通过时不能检查业务"))
-    monkeypatch.setattr(extract, "check_extraction", checker)
+    monkeypatch.setattr(extract, "review_extraction", checker)
 
-    assert extract.main(["--text", TEXT]) == 3
+    assert extract.main(["--text", TEXT]) == (1 if case == "request-error" else 3)
 
     checker.assert_not_called()
-    assert saved_record()["status"] == "validation_error"
+    record = saved_record()
+    assert record["status"] == (
+        "request_error" if case == "request-error" else "validation_error"
+    )
+    assert record["request_status"] == (
+        "error" if case == "request-error" else "completed"
+    )
+    assert record["review"] is None
 
 
 # 模拟磁盘写入失败，核对非零退出码和失败提示，不能误报“记录已保存”。
@@ -712,6 +766,65 @@ def test_input_error_also_saves_a_record_without_model(
     mock_model[1].assert_not_called()
     record = saved_record()
     assert record["status"] == "input_error"
+    assert record["processing_status"] == "input_error"
+    assert record["request_status"] == "not_started"
     assert record["input_text"] == " \t"
     assert record["checks"] is None
     assert record["error_type"] == "ValueError"
+
+
+# wraps 保留真实规则的行为并记录参数；验证输入文件的原文没有被清洗或替换。
+def test_review_receives_original_text_and_preserves_extraction(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    mock_model: tuple[Mock, Mock],
+    extraction: AfterSalesExtraction,
+) -> None:
+    text = f"  {TEXT}\n"
+    path = tmp_path / "售后描述.txt"
+    path.write_text(text, encoding="utf-8")
+    # 留下带空白的原始字段，保证 CLI 不会为通过规则而改成 null 或去掉空白。
+    extraction.order_id = " \t"
+    extraction.evidence = [
+        item for item in extraction.evidence if item.field != "order_id"
+    ]
+    before = extraction.model_dump(mode="json")
+    reviewer = Mock(wraps=review_extraction)
+    monkeypatch.setattr(extract, "review_extraction", reviewer)
+    response = mock_model[0].with_structured_output.return_value.invoke.return_value
+    response["raw"] = raw_message([tool_call(extraction.model_dump_json())])
+
+    assert extract.main(["--text-file", str(path)]) == 0
+
+    reviewer.assert_called_once_with(text, extraction)
+    assert reviewer.call_args.args[1] is extraction
+    assert extraction.model_dump(mode="json") == before
+    record = saved_record()
+    assert record["input_text"] == text
+    assert record["extraction"] == before
+    assert record["review"]["missing_fields"] == ["order_id"]
+    assert record["review"]["questions"] == ["请提供订单号。"]
+    assert record["request_status"] == "completed"
+    assert record["processing_status"] == "needs_clarification"
+
+
+# 连续运行 CLI 两次，每次只有一条 JSONL；验证旧记录未覆盖、编号不同。
+def test_two_cli_runs_append_two_records(mock_model: tuple[Mock, Mock]) -> None:
+    assert extract.main(["--text", TEXT]) == 0
+    path = extraction_record.EXTRACTION_RUNS_PATH  # conftest 已替换为 tmp_path。
+    first_bytes = path.read_bytes()
+    assert extract.main(["--text", TEXT]) == 0
+
+    records = [
+        json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()
+    ]
+    assert len(records) == 2
+    assert path.read_bytes().startswith(first_bytes)
+    assert records[0]["run_id"] != records[1]["run_id"]
+    assert mock_model[0].with_structured_output.return_value.invoke.call_count == 2
+    for record in records:
+        assert record["request_status"] == "completed"
+        assert record["processing_status"] == "draft_ready"
+        assert record["review"]["status"] == "draft_ready"
+        assert record["rules_version"] == "v1"
+        assert record["usage"] is None

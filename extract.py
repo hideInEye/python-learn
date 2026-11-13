@@ -16,7 +16,7 @@ from extraction_record import (
     new_extraction_record,
     redact_values,
 )
-from extraction_rules import check_extraction
+from extraction_rules import review_extraction
 from extractor import (
     OUTPUT_METHODS,
     ExtractionParseError,
@@ -104,6 +104,7 @@ def main(argv: list[str] | None = None) -> int:
         model_name, api_key = load_config()
         record["requested_model"] = model_name
         stage = "request"  # 从这里开始的初始化或调用异常归类为请求错误。
+        record["request_status"] = "error"  # 先设失败；只有实际返回才改成 completed。
         # 关键字参数通过“名字=值”传递；create_model 只初始化已有 SDK 客户端。
         model = create_model(
             model_name=model_name,
@@ -113,18 +114,33 @@ def main(argv: list[str] | None = None) -> int:
         )
         # 根据 mode 发起一次请求；业务检查和追问不会再调用模型。
         response = invoke_extraction(model, text, system_prompt, mode=args.mode)
+        record["request_status"] = "completed"  # 请求完成不代表解析或业务检查成功。
+        stage = "validation"  # 后续异常不会被误记为模型请求失败。
         # 校验失败也保留实际返回的用量与结束原因，不保存整个原始响应。
         collect_extraction_metadata(record, response)
-        stage = "validation"  # 已收到响应，后面的失败属于解析或校验阶段。
         result = parse_extraction_result(response, mode=args.mode)
-        # 对象转 Python 字典，尚未变成 JSON 字符串。
-        record["extraction"] = result.model_dump()
-        record["checks"] = check_extraction(result, text)  # 先查证据，再查必要信息。
-        record["status"] = record["checks"]["status"]  # 用代码检查结果决定最终状态。
+        # mode="json" 生成 JSON 可保存的字典；保留原抽取值，不修改字段或证据。
+        record["extraction"] = result.model_dump(mode="json")
+        # 只在 Schema 与工具结构通过后检查业务；text 始终是最初的用户原文。
+        review = review_extraction(text, result)
+        record["review"] = review.model_dump(mode="json")
+        record["status"] = review.status
+        # 保留旧日志字段；这里只转换键名，不运行旧规则或发起第二次模型请求。
+        record["checks"] = {
+            "status": review.status,
+            "evidence_errors": review.evidence_errors,
+            "missing_fields": None
+            if review.status == "evidence_error"
+            else review.missing_fields,
+            "clarification_questions": review.questions,
+        }
         if record["status"] == "evidence_error":
             record["error_type"] = "EvidenceCheckError"
             record["error_message"] = "原文证据机械检查失败，请核对检查结果。"
-            print("证据检查失败（evidence_error），未进入完整性检查。", file=sys.stderr)
+            print(
+                "抽取结果存在证据问题（evidence_error），不是用户信息不足。",
+                file=sys.stderr,
+            )
             exit_code = 4  # 证据不合格，不进入可复核草稿状态。
     except ExtractionParseError as exc:  # as exc 将捕获的异常绑定到变量。
         record["status"] = "validation_error"
@@ -135,6 +151,9 @@ def main(argv: list[str] | None = None) -> int:
         exit_code = 3
     except KeyboardInterrupt:  # 用户在终端按 Ctrl+C 会触发此异常。
         record["status"] = "cancelled"
+        # 请求已返回后取消本地处理，不抹掉“请求完成”这个事实。
+        if record["request_status"] != "completed":
+            record["request_status"] = "cancelled"
         record["error_type"] = "KeyboardInterrupt"
         record["error_message"] = "用户取消了本次抽取。"
         print("用户取消了本次抽取。", file=sys.stderr)
@@ -175,17 +194,30 @@ def main(argv: list[str] | None = None) -> int:
         # 整个本次处理的耗时（输入、请求、检查）；不含 JSONL 落盘时间。
         record["latency_ms"] = (perf_counter() - started_at) * 1000  # 秒转换成毫秒。
 
+    # 保留 status 供旧代码读取，同时明确命名为 processing_status。
+    record["processing_status"] = record["status"]
     # 只有完成业务检查才打印业务 JSON；解析失败时不拼一个假结果。
-    if record["checks"] is not None:
+    if record["review"] is not None:
         output = {
-            "status": record["status"],
             "extraction": record["extraction"],
+            "review": record["review"],
+            "processing_status": record["processing_status"],
+            "status": record["status"],  # 兼容原有 JSON 输出字段。
             "checks": record["checks"],
         }
         # 先脱敏，再转 JSON；默认 print 写 stdout，方便调用者重定向保存结果。
         print(json.dumps(redact_values(output, api_key), ensure_ascii=False, indent=2))
+        # stdout 继续保持一个可解析的 JSON；中文说明与追问写入 stderr。
+        print("抽取结果：extraction；程序检查结果：review。", file=sys.stderr)
+        if record["processing_status"] == "needs_clarification":
+            print("固定追问：", file=sys.stderr)
+            for question in record["review"]["questions"]:
+                print(f"- {redact_values(question, api_key)}", file=sys.stderr)
+        elif record["processing_status"] == "draft_ready":
+            print("当前检查通过，仅供人工复核，不表示退款批准。", file=sys.stderr)
 
     # stderr 是另一条输出通道，运行信息不会混进 stdout 的 JSON 中。
+    print(f"最终处理状态: {record['processing_status']}", file=sys.stderr)
     print(f"run_id: {record['run_id']}", file=sys.stderr)
     try:
         # 白名单校验后追加；只有成功才会返回保存路径。
